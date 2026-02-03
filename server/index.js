@@ -127,11 +127,12 @@ app.post('/process-video', upload.single('video'), async (req, res) => {
 
         // Define subtitle styles with ASS format
         // Colors are &HAABBGGRR (Alpha, Blue, Green, Red) in Hex
+        // BorderStyle=3 is Opaque Box. BackColour is the box color.
         const styles = {
-            'classic': 'Fontname=Arial,PrimaryColour=&H00FFFFFF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20',
-            'yellow': 'Fontname=Arial,PrimaryColour=&H0000FFFF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20',
-            'black_box': 'Fontname=Arial,PrimaryColour=&H00FFFFFF,BorderStyle=3,BackColour=&H40000000,Outline=0,Shadow=0,MarginV=20', 
-            'bold_red': 'Fontname=Arial,Bold=1,PrimaryColour=&H000000FF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20'
+            'classic': 'Fontname=Arial,PrimaryColour=&H00FFFFFF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20,Alignment=2',
+            'yellow': 'Fontname=Arial,PrimaryColour=&H0000FFFF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20,Alignment=2',
+            'black_box': 'Fontname=Arial,PrimaryColour=&H00FFFFFF,BorderStyle=3,BackColour=&H00000000,Outline=2,Shadow=0,MarginV=20,Alignment=2', 
+            'bold_red': 'Fontname=Arial,Bold=1,PrimaryColour=&H000000FF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20,Alignment=2'
         };
 
         const forceStyle = styles[subtitleLayout] || styles['classic'];
