@@ -21,9 +21,16 @@ const port = 3000;
 
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/output', express.static(path.join(__dirname, 'output')));
 
-const upload = multer({ dest: path.join(__dirname, 'uploads') });
+// Ensure output directory exists and use it as base
+const outputBaseDir = path.join(__dirname, 'output');
+if (!fs.existsSync(outputBaseDir)) {
+    fs.mkdirSync(outputBaseDir, { recursive: true });
+}
+
+// Multer will upload to a temporary temp folder first, then we move it
+const upload = multer({ dest: path.join(__dirname, 'temp_uploads') });
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
@@ -47,18 +54,46 @@ app.post('/process-video', upload.single('video'), async (req, res) => {
         return res.status(400).send('No video file uploaded.');
     }
 
-    const inputPath = req.file.path;
-    // Keep original extension or just use .mp4 for output
     const originalName = req.file.originalname;
     const baseName = path.parse(originalName).name;
-    const audioPath = path.join(__dirname, 'uploads', `${req.file.filename}.mp3`);
-    const srtPath = path.join(__dirname, 'uploads', `${req.file.filename}.srt`);
-    const outputPath = path.join(__dirname, 'uploads', `processed_${req.file.filename}.mp4`);
     
-    // User desired language
-    const language = req.body.language || 'en';
+    // Create specific folder for this video using IST timestamp
+    const now = new Date();
+    const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC + 5:30
+    const istTime = new Date(now.getTime() + istOffset);
+    const folderName = istTime.toISOString().replace(/T/, '_').replace(/\..+/, '').replace(/:/g, '-').slice(0, -1);
+    
+    const videoOutputDir = path.join(__dirname, 'output', folderName);
+    
+    if (!fs.existsSync(videoOutputDir)){
+        fs.mkdirSync(videoOutputDir, { recursive: true });
+    }
 
-    console.log(`Processing ${originalName} in language ${language}...`);
+    const inputPath = path.join(videoOutputDir, originalName);
+    
+    // Move the uploaded file from temp to specific folder
+    fs.renameSync(req.file.path, inputPath);
+
+    const audioPath = path.join(videoOutputDir, 'audio.mp3');
+    const srtPath = path.join(videoOutputDir, 'subtitles.srt');
+    const outputPath = path.join(videoOutputDir, 'processed_video.mp4');
+    const detailsPath = path.join(videoOutputDir, 'details.json');
+    
+    // User desired language and layout
+    const language = req.body.language || 'en';
+    const subtitleLayout = req.body.subtitleLayout || 'classic';
+
+    // Save video details
+    const videoDetails = {
+        originalName: originalName,
+        uploadTime: new Date().toISOString(),
+        language: language,
+        layout: subtitleLayout,
+        status: 'processing'
+    };
+    fs.writeFileSync(detailsPath, JSON.stringify(videoDetails, null, 2));
+
+    console.log(`Processing ${originalName} in language ${language} with layout ${subtitleLayout}...`);
 
     try {
         // 1. Extract Audio
@@ -90,19 +125,51 @@ app.post('/process-video', upload.single('video'), async (req, res) => {
 
         console.log('SRT generated.');
 
+        // Define subtitle styles with ASS format
+        // Colors are &HAABBGGRR (Alpha, Blue, Green, Red) in Hex
+        const styles = {
+            'classic': 'Fontname=Arial,PrimaryColour=&H00FFFFFF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20',
+            'yellow': 'Fontname=Arial,PrimaryColour=&H0000FFFF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20',
+            'black_box': 'Fontname=Arial,PrimaryColour=&H00FFFFFF,BorderStyle=3,BackColour=&H40000000,Outline=0,Shadow=0,MarginV=20', 
+            'bold_red': 'Fontname=Arial,Bold=1,PrimaryColour=&H000000FF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20'
+        };
+
+        const forceStyle = styles[subtitleLayout] || styles['classic'];
+        console.log(`Applying style for ${subtitleLayout}: ${forceStyle}`);
+
         // 4. Burn Subtitles
-        // Windows path handling for subtitles filter is tricky.
-        // The path must be escaped properly. 
-        // A common workaround is to change the working directory or use relative paths carefully.
-        // But ffmpeg-fluent handles simple strings reasonably well, except backslashes on windows in filter strings.
-        // We will try to convert backslashes to forward slashes.
-        const srtPathForwardSlashes = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+        // Switching back to CPU encoding to ensure stability as GPU (NVENC) can be flaky with path escaping/formats.
+        // We use relative path to avoid Windows absolute path escaping issues with the subtitles filter.
+        const relativeSrtPath = path.relative(process.cwd(), srtPath).replace(/\\/g, '/');
 
         await new Promise((resolve, reject) => {
-            ffmpeg(inputPath)
-                .videoFilters(`subtitles='${srtPathForwardSlashes}'`)
+            const command = ffmpeg(inputPath);
+
+            // Apply subtitles filter
+            let subtitleFilter = `subtitles='${relativeSrtPath}'`;
+            if (forceStyle) {
+                subtitleFilter += `:force_style='${forceStyle}'`;
+            }
+
+            command
+                .videoFilters(subtitleFilter)
                 .output(outputPath)
-                .on('end', resolve)
+                .outputOptions([
+                    '-c:v libx264',     // Standard CPU encoder (reliable)
+                    '-preset ultrafast', // Fast encoding speed
+                    '-pix_fmt yuv420p', // Ensure wide compatibility
+                    '-c:a aac',         // Convert audio to AAC for MP4
+                ])
+                .on('start', (cmdLine) => {
+                    console.log('FFmpeg command:', cmdLine);
+                })
+                .on('end', () => {
+                   // update details status
+                   videoDetails.status = 'completed';
+                   videoDetails.processedPath = outputPath;
+                   fs.writeFileSync(detailsPath, JSON.stringify(videoDetails, null, 2));
+                   resolve();
+                })
                 .on('error', (err) => {
                     console.error('FFmpeg burn error:', err);
                     reject(err);
@@ -113,7 +180,7 @@ app.post('/process-video', upload.single('video'), async (req, res) => {
         console.log('Video processed.');
 
         // Construct public URL
-        const fileUrl = `http://localhost:${port}/uploads/processed_${req.file.filename}.mp4`;
+        const fileUrl = `http://localhost:${port}/output/${folderName}/processed_video.mp4`;
         
         // Clean up temp files (optional, leaving them for debugging for now)
         // fs.unlinkSync(inputPath);
