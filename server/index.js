@@ -23,13 +23,11 @@ app.use(cors());
 app.use(express.json());
 app.use('/output', express.static(path.join(__dirname, 'output')));
 
-// Ensure output directory exists and use it as base
 const outputBaseDir = path.join(__dirname, 'output');
 if (!fs.existsSync(outputBaseDir)) {
     fs.mkdirSync(outputBaseDir, { recursive: true });
 }
 
-// Multer will upload to a temporary temp folder first, then we move it
 const upload = multer({ dest: path.join(__dirname, 'temp_uploads') });
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -37,8 +35,7 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 function formatTime(seconds) {
     const date = new Date(0);
     date.setMilliseconds(seconds * 1000);
-    const timeStr = date.toISOString().substr(11, 12).replace('.', ',');
-    return timeStr;
+    return date.toISOString().substr(11, 12).replace('.', ',');
 }
 
 function generateSRT(segments) {
@@ -49,153 +46,221 @@ function generateSRT(segments) {
     }).join('\n');
 }
 
-app.post('/process-video', upload.single('video'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).send('No video file uploaded.');
+function makeOutputDir() {
+    const now = new Date();
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const istTime = new Date(now.getTime() + istOffset);
+    const folderName = istTime.toISOString()
+        .replace(/T/, '_').replace(/\..+/, '').replace(/:/g, '-');
+    const dir = path.join(__dirname, 'output', folderName);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return { dir, folderName };
+}
+
+// On Windows, fluent-ffmpeg can't always find ffprobe automatically — set it explicitly
+import { execSync } from 'child_process';
+
+function findFfprobePath() {
+    try {
+        // Try to find ffprobe in PATH
+        const result = execSync('where ffprobe', { encoding: 'utf8', stdio: ['pipe','pipe','pipe'] }).trim().split('\n')[0].trim();
+        return result || null;
+    } catch {
+        return null;
     }
+}
+
+const ffprobePath = findFfprobePath();
+if (ffprobePath) {
+    ffmpeg.setFfprobePath(ffprobePath);
+    console.log('ffprobe path set to:', ffprobePath);
+} else {
+    console.warn('ffprobe not found in PATH — audio stream detection disabled, extraction will still be attempted');
+}
+
+// Probe whether the file actually has an audio stream
+async function hasAudioStream(inputPath) {
+    return new Promise((resolve) => {
+        ffmpeg.ffprobe(inputPath, (err, metadata) => {
+            if (err) {
+                console.warn('ffprobe error (non-fatal, will attempt extraction anyway):', err.message);
+                resolve(true); // assume audio exists if probe fails — let FFmpeg decide
+                return;
+            }
+            const found = metadata.streams?.some(s => s.codec_type === 'audio');
+            console.log(`ffprobe: audio stream ${found ? 'FOUND' : 'NOT FOUND'} in`, path.basename(inputPath));
+            resolve(!!found);
+        });
+    });
+}
+
+// Extract audio — probes first, surfaces clear errors
+async function extractAudio(inputPath, audioPath) {
+    const audioFound = await hasAudioStream(inputPath);
+    if (!audioFound) {
+        throw new Error('This video has no audio track — nothing to transcribe.');
+    }
+
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .output(audioPath)
+            .noVideo()
+            .audioCodec('libmp3lame')
+            .audioFrequency(16000)   // Whisper works best at 16kHz
+            .audioChannels(1)        // Mono: smaller file, faster upload to Groq
+            .outputOptions(['-q:a 4'])
+            .on('start', (cmd) => console.log('FFmpeg extract cmd:', cmd))
+            .on('end', () => { console.log('Audio extracted:', audioPath); resolve(); })
+            .on('error', (err, _stdout, stderr) => {
+                console.error('FFmpeg extract failed:', err.message);
+                console.error('FFmpeg stderr:', stderr);
+                let hint = '';
+                if (stderr?.includes('Invalid data'))  hint = ' [corrupted or incomplete file]';
+                if (stderr?.includes('No such file'))  hint = ' [file not found — upload may have failed]';
+                if (stderr?.includes('codec'))         hint = ' [unsupported audio codec]';
+                reject(new Error('FFmpeg audio extraction failed' + hint + ': ' + err.message));
+            })
+            .run();
+    });
+}
+
+// Safe delete — never throws
+function safeUnlink(filePath) {
+    try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch (e) {
+        console.warn('Could not delete file:', filePath, e.message);
+    }
+}
+
+// ── /transcribe-only ──────────────────────────────────────────────────────────
+app.post('/transcribe-only', upload.single('video'), async (req, res) => {
+    if (!req.file) return res.status(400).send('No video file uploaded.');
+
+    const { dir } = makeOutputDir();
+    const inputPath = path.join(dir, req.file.originalname);
+    fs.renameSync(req.file.path, inputPath);
+
+    const audioPath = path.join(dir, 'audio.mp3');
+    const language = req.body.language || 'en';
+
+    try {
+        await extractAudio(inputPath, audioPath);
+
+        if (!fs.existsSync(audioPath)) {
+            throw new Error('Audio file was not created — FFmpeg may have exited silently.');
+        }
+
+        const transcription = await groq.audio.transcriptions.create({
+            file: fs.createReadStream(audioPath),
+            model: 'whisper-large-v3',
+            language,
+            response_format: 'verbose_json',
+        });
+
+        safeUnlink(audioPath);
+        res.json({ segments: transcription.segments });
+
+    } catch (err) {
+        console.error('Transcribe error:', err.message);
+        safeUnlink(audioPath);
+        res.status(500).send('Error transcribing: ' + err.message);
+    }
+});
+
+// ── /process-video ────────────────────────────────────────────────────────────
+app.post('/process-video', upload.single('video'), async (req, res) => {
+    if (!req.file) return res.status(400).send('No video file uploaded.');
 
     const originalName = req.file.originalname;
-    const baseName = path.parse(originalName).name;
-    
-    // Create specific folder for this video using IST timestamp
-    const now = new Date();
-    const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC + 5:30
-    const istTime = new Date(now.getTime() + istOffset);
-    const folderName = istTime.toISOString().replace(/T/, '_').replace(/\..+/, '').replace(/:/g, '-').slice(0, -1);
-    
-    const videoOutputDir = path.join(__dirname, 'output', folderName);
-    
-    if (!fs.existsSync(videoOutputDir)){
-        fs.mkdirSync(videoOutputDir, { recursive: true });
-    }
+    const { dir: videoOutputDir, folderName } = makeOutputDir();
 
     const inputPath = path.join(videoOutputDir, originalName);
-    
-    // Move the uploaded file from temp to specific folder
     fs.renameSync(req.file.path, inputPath);
 
     const audioPath = path.join(videoOutputDir, 'audio.mp3');
     const srtPath = path.join(videoOutputDir, 'subtitles.srt');
     const outputPath = path.join(videoOutputDir, 'processed_video.mp4');
     const detailsPath = path.join(videoOutputDir, 'details.json');
-    
-    // User desired language and layout
+
     const language = req.body.language || 'en';
     const subtitleLayout = req.body.subtitleLayout || 'classic';
+    const providedSRT = req.body.srtContent || null;
 
-    // Save video details
     const videoDetails = {
-        originalName: originalName,
-        uploadTime: new Date().toISOString(),
-        language: language,
-        layout: subtitleLayout,
-        status: 'processing'
+        originalName, uploadTime: new Date().toISOString(),
+        language, layout: subtitleLayout, status: 'processing'
     };
     fs.writeFileSync(detailsPath, JSON.stringify(videoDetails, null, 2));
 
-    console.log(`Processing ${originalName} in language ${language} with layout ${subtitleLayout}...`);
+    console.log(`Processing ${originalName} | lang:${language} | layout:${subtitleLayout} | customSRT:${!!providedSRT}`);
 
     try {
-        // 1. Extract Audio
-        await new Promise((resolve, reject) => {
-            ffmpeg(inputPath)
-                .output(audioPath)
-                .noVideo()
-                .audioCodec('libmp3lame')
-                .on('end', resolve)
-                .on('error', reject)
-                .run();
-        });
+        let srtContent;
 
-        console.log('Audio extracted.');
+        if (providedSRT) {
+            srtContent = providedSRT;
+        } else {
+            await extractAudio(inputPath, audioPath);
 
-        // 2. Transcribe with Groq
-        const transcription = await groq.audio.transcriptions.create({
-            file: fs.createReadStream(audioPath),
-            model: "whisper-large-v3",
-            language: language,
-            response_format: "verbose_json",
-        });
+            if (!fs.existsSync(audioPath)) {
+                throw new Error('Audio file was not created — FFmpeg may have exited silently.');
+            }
 
-        console.log('Transcription complete.');
+            const transcription = await groq.audio.transcriptions.create({
+                file: fs.createReadStream(audioPath),
+                model: 'whisper-large-v3',
+                language,
+                response_format: 'verbose_json',
+            });
+            console.log('Transcription complete.');
 
-        // 3. Generate SRT
-        const srtContent = generateSRT(transcription.segments);
+            safeUnlink(audioPath);
+            srtContent = generateSRT(transcription.segments);
+        }
+
         fs.writeFileSync(srtPath, srtContent);
+        console.log('SRT written.');
 
-        console.log('SRT generated.');
-
-        // Define subtitle styles with ASS format
-        // Colors are &HAABBGGRR (Alpha, Blue, Green, Red) in Hex
-        // BorderStyle=3 is Opaque Box. BackColour is the box color.
         const styles = {
-            'classic': 'Fontname=Arial,PrimaryColour=&H00FFFFFF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20,Alignment=2',
-            'yellow': 'Fontname=Arial,PrimaryColour=&H0000FFFF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20,Alignment=2',
-            'black_box': 'Fontname=Arial,PrimaryColour=&H00FFFFFF,BorderStyle=3,BackColour=&H00000000,Outline=2,Shadow=0,MarginV=20,Alignment=2', 
-            'bold_red': 'Fontname=Arial,Bold=1,PrimaryColour=&H000000FF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20,Alignment=2'
+            classic:   'Fontname=Arial,PrimaryColour=&H00FFFFFF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20,Alignment=2',
+            yellow:    'Fontname=Arial,PrimaryColour=&H0000FFFF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20,Alignment=2',
+            black_box: 'Fontname=Arial,PrimaryColour=&H00FFFFFF,BorderStyle=3,BackColour=&H00000000,Outline=2,Shadow=0,MarginV=20,Alignment=2',
+            bold_red:  'Fontname=Arial,Bold=1,PrimaryColour=&H000000FF,BorderStyle=1,Outline=1,Shadow=1,MarginV=20,Alignment=2',
         };
 
-        const forceStyle = styles[subtitleLayout] || styles['classic'];
-        console.log(`Applying style for ${subtitleLayout}: ${forceStyle}`);
-
-        // 4. Burn Subtitles
-        // Switching back to CPU encoding to ensure stability as GPU (NVENC) can be flaky with path escaping/formats.
-        // We use relative path to avoid Windows absolute path escaping issues with the subtitles filter.
+        const forceStyle = styles[subtitleLayout] || styles.classic;
         const relativeSrtPath = path.relative(process.cwd(), srtPath).replace(/\\/g, '/');
 
         await new Promise((resolve, reject) => {
-            const command = ffmpeg(inputPath);
-
-            // Apply subtitles filter
-            let subtitleFilter = `subtitles='${relativeSrtPath}'`;
-            if (forceStyle) {
-                subtitleFilter += `:force_style='${forceStyle}'`;
-            }
-
-            command
+            const subtitleFilter = `subtitles='${relativeSrtPath}':force_style='${forceStyle}'`;
+            ffmpeg(inputPath)
                 .videoFilters(subtitleFilter)
                 .output(outputPath)
-                .outputOptions([
-                    '-c:v libx264',     // Standard CPU encoder (reliable)
-                    '-preset ultrafast', // Fast encoding speed
-                    '-pix_fmt yuv420p', // Ensure wide compatibility
-                    '-c:a aac',         // Convert audio to AAC for MP4
-                ])
-                .on('start', (cmdLine) => {
-                    console.log('FFmpeg command:', cmdLine);
-                })
+                .outputOptions(['-c:v libx264', '-preset ultrafast', '-pix_fmt yuv420p', '-c:a aac'])
+                .on('start', (cmd) => console.log('FFmpeg burn cmd:', cmd))
                 .on('end', () => {
-                   // update details status
-                   videoDetails.status = 'completed';
-                   videoDetails.processedPath = outputPath;
-                   fs.writeFileSync(detailsPath, JSON.stringify(videoDetails, null, 2));
-                   resolve();
+                    videoDetails.status = 'completed';
+                    videoDetails.processedPath = outputPath;
+                    fs.writeFileSync(detailsPath, JSON.stringify(videoDetails, null, 2));
+                    resolve();
                 })
-                .on('error', (err) => {
-                    console.error('FFmpeg burn error:', err);
-                    reject(err);
+                .on('error', (err, _stdout, stderr) => {
+                    console.error('FFmpeg burn error:', err.message);
+                    console.error('FFmpeg stderr:', stderr);
+                    reject(new Error('FFmpeg burn failed: ' + err.message));
                 })
                 .run();
         });
 
         console.log('Video processed.');
-
-        // Construct public URL
-        const fileUrl = `http://localhost:${port}/output/${folderName}/processed_video.mp4`;
-        
-        // Clean up temp files (optional, leaving them for debugging for now)
-        // fs.unlinkSync(inputPath);
-        // fs.unlinkSync(audioPath);
-        // fs.unlinkSync(srtPath);
-
-        res.json({ url: fileUrl });
+        res.json({ url: `http://localhost:${port}/output/${folderName}/processed_video.mp4` });
 
     } catch (error) {
-        console.error('Error processing:', error);
+        console.error('Error processing:', error.message);
+        safeUnlink(audioPath);
         res.status(500).send('Error processing video: ' + error.message);
     }
 });
 
-app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
-});
+app.listen(port, () => console.log(`Server running at http://localhost:${port}`));
